@@ -1,0 +1,90 @@
+services:
+  postgres:
+    image: "postgres:16-alpine"
+    pull_policy: missing
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    environment:
+      - "POSTGRES_USER=test_user"
+      - "POSTGRES_PASSWORD=test_password"
+      - "POSTGRES_DB=test_db"
+    ports:
+      - "5432"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U test_user -d test_db"
+      interval: "3s"
+      timeout: "5s"
+      retries: "10"
+    tmpfs:
+      - /var/lib/postgresql/data
+    labels:
+      - external-url=postgresql://localhost:{{PORT}}/test_db?user=test_user&password=test_password
+
+  sut:
+    build:
+      context: ${BUILD_CONTEXT}
+      dockerfile_inline: |
+        FROM nixos/nix AS build
+
+        # We need a non-root user for poetry, which doesn't like installing packages as root
+        RUN mkdir -p /app && \
+            echo "builder:x:1000:1000:Builder:/app:/bin/sh" >> /etc/passwd && \
+            echo "builder:x:1000:" >> /etc/group && \
+            chown -R 1000:1000 /app
+        WORKDIR /app
+
+        # Only copy files relevant for the nix-shell in an earlier layer to
+        # have this be cached when those files don't change
+        COPY --chown=1000:1000 ./shell.nix ./
+        COPY --chown=1000:1000 ./nix ./nix
+        RUN nix-shell --argstr type build
+
+        COPY --chown=1000:1000 . ./
+        RUN \
+          # Clean all untracked git files in case this is built in an unclean tree
+          nix-shell --argstr type build --run "if [ -d .git ]; then git clean -ffxd; fi" \
+          # Install Python dependencies
+          && nix-shell --argstr type build --run "cd /app && HOME=/app poetry install -n --no-dev" \
+          # Clean up garbage in a nix-shell with runtime dependencies, meaning everything
+          # not needed in it should be removed
+          && /app/docker-entrypoints/run.sh nix-env -iA nixpkgs.bashInteractive \
+          && /app/docker-entrypoints/run.sh nix-collect-garbage -d
+
+        # Multi-stage build to only propagate what we need
+        FROM nixos/nix
+
+        # Heroku stack images have these set, so we need to set them too
+        # to make Gunicorn work as expected
+        ENV \
+            FORWARDED_ALLOW_IPS="*" \
+            GUNICORN_CMD_ARGS="--access-logfile -" \
+            NIX_BUILD_SHELL=/nix/var/nix/profiles/default/bin/bash
+
+        COPY --from=build /nix /nix
+        # Needed such that the nixpkgs fetched with fetchTarball isn't redownloaded
+        COPY --from=build --chown=root:root /root /root
+        COPY --from=build /app /app
+
+        WORKDIR /app
+
+        # Set the entrypoint
+        ENTRYPOINT ["/app/docker-entrypoints/run.sh"]
+
+        # Default command
+        CMD ["bash"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "8000"
+    labels:
+      - jwt-signing-config:hs256:this_is_a_secret_meeting_all_requirements_of_any_hs_algorithms
+    command: ["gunicorn", "--paste", "/app/etc/production.ini", "--bind", "0.0.0.0:8000"]
